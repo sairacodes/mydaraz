@@ -49,7 +49,10 @@ pipeline {
                 echo '🐳 Building & starting docker-compose stack...'
                 sh '''
                     set -e
-                    docker-compose down --remove-orphans || true
+                    # Stop & remove any stack from previous builds (any project name)
+                    docker-compose down --remove-orphans --volumes || true
+                    docker rm -f daraz_mongodb daraz_backend daraz_frontend 2>/dev/null || true
+
                     docker-compose build --no-cache
                     docker-compose up -d
                     docker-compose ps
