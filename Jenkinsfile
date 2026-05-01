@@ -10,8 +10,8 @@ pipeline {
 
     environment {
         APP_NAME        = "multitenant-daraz"
-        APP_URL         = "http://localhost:5173"
-        BACKEND_HEALTH  = "http://localhost:5000/api/health"
+        APP_URL         = "http://16.170.7.20:5173"
+        BACKEND_HEALTH  = "http://16.170.7.20:5000/api/health"
         DOCKER_TEST_IMG = "daraz-selenium-tests"
         GIT_AUTHOR_EMAIL = sh(
             script: "git log -1 --format='%ae'",
