@@ -1,6 +1,7 @@
 # ── Dockerfile.test ───────────────────────────────────────────
-# Custom Docker image for running Selenium tests with headless Chrome
-# Used by Jenkins pipeline test stage on AWS EC2
+# Selenium headless Chrome test runner for Multi-Tenant Daraz Clone
+# Uses modern Chrome installation (post Debian-12 apt-key removal)
+# and the Chrome-for-Testing endpoint for matching ChromeDriver.
 # ──────────────────────────────────────────────────────────────
 
 FROM python:3.11-slim
@@ -8,78 +9,48 @@ FROM python:3.11-slim
 LABEL maintainer="saira@comsats.edu.pk"
 LABEL description="Selenium headless Chrome test runner for Multi-Tenant Daraz Clone"
 
-# ── Install system dependencies ────────────────────────────────
-RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    gnupg \
-    unzip \
-    ca-certificates \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libc6 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libexpat1 \
-    libfontconfig1 \
-    libgbm1 \
-    libgcc1 \
-    libglib2.0-0 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libstdc++6 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    lsb-release \
-    xdg-utils \
-    --no-install-recommends \
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System dependencies for Chrome ─────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget curl gnupg unzip ca-certificates \
+        fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+        libcups2 libdbus-1-3 libdrm2 libgbm1 libnspr4 libnss3 \
+        libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 \
+        xdg-utils libu2f-udev libvulkan1 \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Install Google Chrome ──────────────────────────────────────
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
-       > /etc/apt/sources.list.d/google-chrome.list \
+# ── Install Google Chrome (modern way: direct .deb, no apt-key) ─
+RUN wget -q -O /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get update \
-    && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    && google-chrome --version
 
-# ── Install matching ChromeDriver ─────────────────────────────
-RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
-    && CHROMEDRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_VERSION%%.*}") \
-    && wget -q "https://chromedriver.storage.googleapis.com/${CHROMEDRIVER_VERSION}/chromedriver_linux64.zip" \
-    && unzip chromedriver_linux64.zip -d /usr/bin/ \
-    && rm chromedriver_linux64.zip \
-    && chmod +x /usr/bin/chromedriver
+# ── Install matching ChromeDriver via Chrome for Testing ───────
+RUN DRIVER_URL=$(curl -s https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json \
+        | python3 -c "import sys, json; d=json.load(sys.stdin); \
+print([x['url'] for x in d['channels']['Stable']['downloads']['chromedriver'] if x['platform']=='linux64'][0])") \
+    && echo "Downloading $DRIVER_URL" \
+    && wget -q -O /tmp/cd.zip "$DRIVER_URL" \
+    && unzip -j /tmp/cd.zip "*/chromedriver" -d /usr/bin/ \
+    && chmod +x /usr/bin/chromedriver \
+    && rm /tmp/cd.zip \
+    && chromedriver --version
 
-# ── Set working directory ──────────────────────────────────────
 WORKDIR /app
 
-# ── Copy and install Python dependencies ──────────────────────
+# ── Python dependencies ────────────────────────────────────────
 COPY tests/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy test files ────────────────────────────────────────────
+# ── Test sources ───────────────────────────────────────────────
 COPY tests/ ./tests/
 COPY pytest.ini .
 
-# ── Default command: run all tests and generate HTML report ───
+# ── Default command: run all tests, generate HTML report ──────
 CMD ["pytest", "tests/test_daraz.py", "-v", \
      "--html=tests/test-report.html", \
      "--self-contained-html"]

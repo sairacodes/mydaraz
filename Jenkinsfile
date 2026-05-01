@@ -1,17 +1,17 @@
 // ════════════════════════════════════════════════════════════
 //  Jenkinsfile — Multi-Tenant Daraz Clone
 //  Course  : DevOps for Cloud Computing
-//  Pipeline: GitHub Push → Build → Test (Docker+Selenium) → Deploy → Email
+//  Pipeline: GitHub Push → Build → Deploy (compose) → Test → Email
 // ════════════════════════════════════════════════════════════
 
 pipeline {
 
     agent any
 
-    // ── Environment variables ────────────────────────────────
     environment {
-        APP_NAME       = "multitenant-daraz"
-        APP_URL        = "http://localhost:5173"          // Update to EC2 public IP in production
+        APP_NAME        = "multitenant-daraz"
+        APP_URL         = "http://localhost:5173"
+        BACKEND_HEALTH  = "http://localhost:5000/api/health"
         DOCKER_TEST_IMG = "daraz-selenium-tests"
         GIT_AUTHOR_EMAIL = sh(
             script: "git log -1 --format='%ae'",
@@ -19,9 +19,13 @@ pipeline {
         ).trim()
     }
 
-    // ── Triggers: run on every GitHub push ──────────────────
     triggers {
         githubPush()
+    }
+
+    options {
+        timestamps()
+        timeout(time: 25, unit: 'MINUTES')
     }
 
     stages {
@@ -31,77 +35,63 @@ pipeline {
             steps {
                 echo '📥 Checking out code from GitHub...'
                 checkout scm
-                sh 'echo "Branch: $(git branch --show-current)"'
-                sh 'echo "Commit: $(git log -1 --oneline)"'
-                sh 'echo "Author: $(git log -1 --format="%an <%ae>")"'
+                sh 'git log -1 --oneline'
+                sh 'git log -1 --format="Author: %an <%ae>"'
             }
         }
 
-        // ── Stage 2: Build Backend ───────────────────────────
-        stage('Build Backend') {
+        // ── Stage 2: Build & Deploy full stack via Docker Compose ─
+        // This builds backend + frontend images and starts mongo,
+        // backend (with proper MONGO_URI / JWT_SECRET env vars from
+        // docker-compose.yml), and frontend in one go.
+        stage('Build & Deploy Stack') {
             steps {
-                echo '🔧 Installing backend dependencies...'
-                dir('backend') {
-                    sh 'npm ci --prefer-offline'
-                }
-            }
-        }
-
-        // ── Stage 3: Build Frontend ──────────────────────────
-        stage('Build Frontend') {
-            steps {
-                echo '⚛️  Building React frontend...'
-                dir('frontend') {
-                    sh 'npm ci --prefer-offline'
-                    sh 'npm run build'
-                }
-            }
-        }
-
-        // ── Stage 4: Start Application ───────────────────────
-        stage('Start Application') {
-            steps {
-                echo '🚀 Starting backend server for testing...'
+                echo '🐳 Building & starting docker-compose stack...'
                 sh '''
-                    # Kill any existing backend on port 5000
-                    pkill -f "node server.js" || true
-                    sleep 1
+                    set -e
+                    docker-compose down --remove-orphans || true
+                    docker-compose build --no-cache
+                    docker-compose up -d
+                    docker-compose ps
+                '''
+            }
+        }
 
-                    # Start backend in background
-                    cd backend
-                    nohup node server.js > /tmp/backend.log 2>&1 &
-                    echo $! > /tmp/backend.pid
-
-                    # Wait for server to be ready
-                    echo "Waiting for backend to start..."
-                    for i in $(seq 1 20); do
-                        if curl -s http://localhost:5000/api/health > /dev/null 2>&1; then
-                            echo "✅ Backend is up!"
+        // ── Stage 3: Wait for stack to be healthy ────────────
+        stage('Wait for Health') {
+            steps {
+                echo '⏳ Waiting for backend & frontend to come up...'
+                sh '''
+                    echo "Waiting for backend (${BACKEND_HEALTH})..."
+                    for i in $(seq 1 40); do
+                        if curl -sf ${BACKEND_HEALTH} > /dev/null 2>&1; then
+                            echo "✅ Backend is healthy"
                             break
                         fi
-                        sleep 2
-                        echo "  Attempt $i/20..."
+                        sleep 3
                     done
-                '''
+                    if ! curl -sf ${BACKEND_HEALTH} > /dev/null 2>&1; then
+                        echo "❌ Backend never became healthy. Logs:"
+                        docker-compose logs --tail=120 backend
+                        exit 1
+                    fi
 
-                echo '⚛️  Serving frontend build...'
-                sh '''
-                    # Kill any existing frontend server
-                    pkill -f "serve" || true
-                    sleep 1
-
-                    # Serve the built frontend
-                    npx serve -s frontend/dist -l 5173 &
-                    echo $! > /tmp/frontend.pid
-                    sleep 4
-
-                    echo "✅ Frontend served at port 5173"
+                    echo "Waiting for frontend (${APP_URL})..."
+                    for i in $(seq 1 30); do
+                        if curl -sf ${APP_URL} > /dev/null 2>&1; then
+                            echo "✅ Frontend is up"
+                            exit 0
+                        fi
+                        sleep 2
+                    done
+                    echo "❌ Frontend never became reachable. Logs:"
+                    docker-compose logs --tail=120 frontend
+                    exit 1
                 '''
             }
         }
 
-        // ── Stage 5: TEST STAGE ──────────────────────────────
-        // Runs Selenium tests in a Docker container (headless Chrome)
+        // ── Stage 4: TEST STAGE (containerized) ──────────────
         stage('Test') {
             steps {
                 echo '🧪 Building Selenium test Docker image...'
@@ -109,16 +99,16 @@ pipeline {
 
                 echo '🧪 Running 18 automated Selenium test cases in Docker...'
                 sh """
-                    docker run --rm \
-                        --network host \
-                        -e APP_URL=${APP_URL} \
-                        -v \$(pwd)/tests:/app/tests \
-                        ${DOCKER_TEST_IMG}:${BUILD_NUMBER} \
-                        pytest tests/test_daraz.py -v \
-                            --html=tests/test-report.html \
-                            --self-contained-html \
-                            --tb=short \
-                            -p no:warnings \
+                    docker run --rm \\
+                        --network host \\
+                        -e APP_URL=${APP_URL} \\
+                        -v \$(pwd)/tests:/app/tests \\
+                        ${DOCKER_TEST_IMG}:${BUILD_NUMBER} \\
+                        pytest tests/test_daraz.py -v \\
+                            --html=tests/test-report.html \\
+                            --self-contained-html \\
+                            --tb=short \\
+                            -p no:warnings \\
                         || true
                 """
             }
@@ -126,34 +116,15 @@ pipeline {
                 always {
                     echo '📊 Archiving test report...'
                     publishHTML([
-                        allowMissing: false,
+                        allowMissing: true,
                         alwaysLinkToLastBuild: true,
                         keepAll: true,
                         reportDir: 'tests',
                         reportFiles: 'test-report.html',
                         reportName: 'Selenium Test Report'
                     ])
-
-                    echo '🧹 Cleaning up test Docker image...'
                     sh "docker rmi ${DOCKER_TEST_IMG}:${BUILD_NUMBER} || true"
                 }
-            }
-        }
-
-        // ── Stage 6: Deploy ──────────────────────────────────
-        stage('Deploy') {
-            steps {
-                echo '🚀 Deploying with Docker Compose...'
-                sh '''
-                    # Stop old containers
-                    docker-compose down --remove-orphans || true
-
-                    # Build and start fresh
-                    docker-compose up -d --build
-
-                    echo "✅ Deployment complete!"
-                    docker-compose ps
-                '''
             }
         }
     }
@@ -163,16 +134,6 @@ pipeline {
 
         always {
             echo '📧 Sending test results email...'
-
-            // Parse test results from pytest output
-            script {
-                def testReport = ""
-                try {
-                    testReport = readFile('tests/test-report.html').take(500)
-                } catch (e) {
-                    testReport = "Test report not available."
-                }
-            }
 
             emailext(
                 subject: "[${currentBuild.currentResult}] Daraz Clone — Build #${BUILD_NUMBER} | ${GIT_AUTHOR_EMAIL}",
@@ -217,11 +178,11 @@ pipeline {
                       </tr>
                       <tr style="background: #f9fafb;">
                         <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;"><strong>Branch</strong></td>
-                        <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;">${GIT_BRANCH}</td>
+                        <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;">${env.GIT_BRANCH ?: 'main'}</td>
                       </tr>
                       <tr style="background: white;">
                         <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;"><strong>Commit</strong></td>
-                        <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;">${GIT_COMMIT?.take(10)}</td>
+                        <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;">${env.GIT_COMMIT?.take(10) ?: 'n/a'}</td>
                       </tr>
                       <tr style="background: #f9fafb;">
                         <td style="padding: 10px 14px; border-bottom: 1px solid #e5e7eb;"><strong>Duration</strong></td>
@@ -244,7 +205,7 @@ pipeline {
                       TC-11: Customer login &nbsp;|&nbsp; TC-12: Seller login<br/>
                       TC-13: Seller dashboard &nbsp;|&nbsp; TC-14: Seller products<br/>
                       TC-15: Admin login &nbsp;|&nbsp; TC-16: Admin stores list<br/>
-                      TC-17: DB Schema Inspector &nbsp;|&nbsp; TC-18: Register page
+                      TC-17: Collections page &nbsp;|&nbsp; TC-18: Register page
                     </div>
 
                     <p style="margin-top: 20px;">
@@ -253,7 +214,7 @@ pipeline {
                         View Full Build →
                       </a>
                       &nbsp;&nbsp;
-                      <a href="${BUILD_URL}Selenium_Test_Report/" style="background: #1a73e8; color: white;
+                      <a href="${BUILD_URL}Selenium_20Test_20Report/" style="background: #1a73e8; color: white;
                          padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
                         View Test Report →
                       </a>
@@ -273,21 +234,11 @@ pipeline {
         }
 
         success {
-            echo '✅ Pipeline completed successfully!'
+            echo '✅ Pipeline completed successfully — stack is deployed.'
         }
 
         failure {
-            echo '❌ Pipeline failed — check logs above'
-        }
-
-        cleanup {
-            echo '🧹 Cleaning workspace...'
-            sh '''
-                # Kill temp servers used during testing
-                [ -f /tmp/frontend.pid ] && kill $(cat /tmp/frontend.pid) || true
-                [ -f /tmp/backend.pid ]  && kill $(cat /tmp/backend.pid)  || true
-                rm -f /tmp/backend.pid /tmp/frontend.pid /tmp/backend.log
-            '''
+            echo '❌ Pipeline failed — check logs above.'
         }
     }
 }
