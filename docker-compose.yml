@@ -1,0 +1,75 @@
+version: '3.8'
+
+# ── Multi-Tenant Daraz Clone — Docker Compose ─────────────────
+# Production deployment on AWS EC2
+# Services: MongoDB + Backend (Node/Express) + Frontend (Nginx)
+
+services:
+
+  # ── MongoDB ──────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: daraz_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: multitenant_daraz
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - daraz_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend API ───────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: daraz_backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: 5000
+      MONGO_URI: mongodb://mongodb:27017/multitenant_daraz
+      JWT_SECRET: ${JWT_SECRET:-supersecretjwtkey12345678901234}
+      JWT_EXPIRE: 7d
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-refreshsecretkey12345678901234}
+      JWT_REFRESH_EXPIRE: 30d
+      NODE_ENV: production
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - daraz_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Frontend (Nginx) ──────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: daraz_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    networks:
+      - daraz_network
+
+volumes:
+  mongo_data:
+    name: daraz_mongo_data
+
+networks:
+  daraz_network:
+    name: daraz_network
+    driver: bridge
